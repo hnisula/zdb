@@ -20,7 +20,7 @@ pub const Initialize = struct {
 
 pub const SetBreakpoints = struct {
     const cmd = @tagName(Command.setBreakpoints);
-    source: []const u8,
+    source: []const u8, // TODO: Change to the source object it should be instead of string
     breakpoints: ?[]SourceBreakpoint = null,
     sourceModified: ?bool = null,
 };
