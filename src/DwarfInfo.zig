@@ -30,8 +30,12 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, binary_path: []const u8) !DwarfI
     const dies = dwarf.sections[@intFromEnum(std.debug.Dwarf.Section.Id.debug_info)].?.data;
     var offset: usize = 0;
 
-    while (try dwarf_info.readCu(&abbrevs, dies, &offset)) |cu| {
-        std.debug.print("{d}", .{cu.die.tag});
+    while (dies.len > offset) {
+        const cu_offset = offset;
+        const cu = try dwarf_info.readCu(&abbrevs, dies, &offset);
+        std.debug.print("CU tag: {d}\nCU size: {d}\n", .{ cu.die.tag, cu.header.unit_len });
+
+        offset = cu_offset + cu.header.unit_len;
     }
 
     return dwarf_info;
@@ -107,7 +111,7 @@ const CuHeader = struct {
     offset: u64,
     dwarf_format: u8, // Dwarf format (32 or 64 bit) in bytes (4 or 8)
     len: u64,
-    span_len: u64,
+    unit_len: u64,
     version: u16,
     unit_type: u8,
     addr_size: u8,
@@ -174,6 +178,7 @@ fn readCuHeader(data: []const u8, offset: *usize) CuHeader {
     const endian = builtin.cpu.arch.endian();
     const header_start = offset.*;
     var unit_len: u64 = @intCast(std.mem.readInt(u32, data[offset.*..][0..4], endian));
+    var len_size: u8 = 4;
     var format: u8 = 4;
     offset.* += 4;
     var header_len: u64 = 4 + 2 + 1 + 1 + 4;
@@ -181,6 +186,7 @@ fn readCuHeader(data: []const u8, offset: *usize) CuHeader {
         unit_len = std.mem.readInt(u64, data[offset.*..][0..8], endian);
         offset.* += 8;
         header_len += 8;
+        len_size += 8;
         format = 8;
     }
     const version = std.mem.readInt(u16, data[offset.*..][0..2], endian);
@@ -192,7 +198,7 @@ fn readCuHeader(data: []const u8, offset: *usize) CuHeader {
         .offset = header_start,
         .dwarf_format = format,
         .len = header_len,
-        .span_len = unit_len,
+        .unit_len = unit_len + len_size,
         .version = version,
         .unit_type = unit_type,
         .addr_size = addr_size,
@@ -210,7 +216,7 @@ const DieType = enum(u32) {
 const ParseContext = struct {
     die_scratch: std.ArrayList(Die),
     attr_scratch: std.ArrayList(Attribute),
-    cu_header: CuHeader,
+    cu_header: *const CuHeader,
 };
 
 const FormValue = union(enum) {
@@ -232,7 +238,8 @@ const Die = struct {
     abbrev_code: u64,
     tag: u64,
     attrs: []const Attribute,
-    children: []const Die,
+    child_offset: u64,
+    children: ?[]const Die,
 };
 
 const DwarfError = error{
@@ -246,14 +253,14 @@ fn readDie(
     abbrevs: *const std.AutoHashMap(u64, Abbrev),
     data: []const u8,
     offset: *usize,
-) !?Die {
+    parse_children: bool,
+) (DwarfError || std.mem.Allocator.Error)!?Die {
     const abbrev_code = readUleb128(data, offset);
     if (abbrev_code == 0) {
         return null;
     }
     const abbrev = abbrevs.get(abbrev_code) orelse return DwarfError.Unknown;
     const SectionId = std.debug.Dwarf.Section.Id;
-    const child_mark = context.die_scratch.items.len;
 
     // attributes
     for (abbrev.attributes) |abbrev_attr| {
@@ -291,18 +298,35 @@ fn readDie(
     context.attr_scratch.clearRetainingCapacity();
 
     // children
-    var children: []const Die = &.{};
-    if (abbrev.has_children) {
-        while (try self.readDie(context, abbrevs, data, offset)) |child| {
-            try context.die_scratch.append(self.gpa, child);
-        }
-        const child_count = context.die_scratch.items.len - child_mark;
-        std.debug.assert(child_count > 0);
-        children = try self.arena.allocator().alloc(Die, child_count);
-        context.die_scratch.shrinkRetainingCapacity(child_mark);
+    const child_offset = offset.*;
+    var children: ?[]const Die = null;
+    if (!abbrev.has_children) {
+        children = &.{};
+    } else if (parse_children and abbrev.has_children) {
+        children = try self.readDieChildren(context, abbrevs, data, child_offset);
     }
 
-    return .{ .abbrev_code = abbrev_code, .tag = abbrev.tag, .attrs = die_attrs, .children = children };
+    return .{ .abbrev_code = abbrev_code, .tag = abbrev.tag, .attrs = die_attrs, .child_offset = child_offset, .children = children };
+}
+
+fn readDieChildren(
+    self: *DwarfInfo,
+    context: *ParseContext,
+    abbrevs: *const std.AutoHashMap(u64, Abbrev),
+    data: []const u8,
+    child_offset: u64,
+) ![]const Die {
+    const child_mark = context.die_scratch.items.len;
+    var offset = child_offset;
+    while (try self.readDie(context, abbrevs, data, &offset, true)) |child| {
+        try context.die_scratch.append(self.gpa, child);
+    }
+    const child_count = context.die_scratch.items.len - child_mark;
+    std.debug.assert(child_count > 0);
+    const children = try self.arena.allocator().alloc(Die, child_count);
+    context.die_scratch.shrinkRetainingCapacity(child_mark);
+
+    return children;
 }
 
 const Cu = struct {
@@ -310,16 +334,16 @@ const Cu = struct {
     die: Die,
 };
 
-fn readCu(self: *DwarfInfo, abbrevs: *const std.AutoHashMap(u64, Abbrev), data: []const u8, offset: *usize) !?Cu {
+fn readCu(self: *DwarfInfo, abbrevs: *const std.AutoHashMap(u64, Abbrev), data: []const u8, offset: *usize)!Cu {
     const header = readCuHeader(data, offset);
     var context: ParseContext = .{
         .attr_scratch = try .initCapacity(self.gpa, 64),
         .die_scratch = .empty,
-        .cu_header = header,
+        .cu_header = &header,
     };
     defer context.attr_scratch.deinit(self.gpa);
     defer context.die_scratch.deinit(self.gpa);
-    const die = try self.readDie(&context, abbrevs, data, offset) orelse return null;
+    const die = try self.readDie(&context, abbrevs, data, offset, false) orelse return DwarfError.Unknown;
 
     return .{ .header = header, .die = die };
 }
