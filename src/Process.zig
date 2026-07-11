@@ -1,51 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const DebugInfo = @import("DebugInfo.zig");
 const linux = std.os.linux;
 
-const StopReason = enum {
-    stopped,
-    exited,
-    continued,
-    terminated, // By a signal
+const Process = @This();
+
+pid: if (builtin.os.tag == .windows) u32 else std.posix.pid_t,
+handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void,
+mem_fd: if (builtin.os.tag == .windows) void else std.posix.fd_t,
+
+breakpoints: []const Breakpoint,
+
+const Breakpoint = struct {
+    addr: u64,
+    original_byte: u8,
 };
-
-const WaitError = error{
-    InvalidChild,
-    Interrupted,
-};
-
-pub fn waitForStop(pid: i64) !StopReason {
-    switch (builtin.os.tag) {
-        .linux => {
-            var status: u32 = undefined;
-            const rc = linux.waitpid(@intCast(pid), &status, 0);
-            return switch (std.posix.errno(rc)) {
-                .SUCCESS => blk: {
-                    const W = linux.W;
-                    if (W.IFSTOPPED(status)) {
-                        break :blk StopReason.stopped;
-                    } else if (W.IFEXITED(status)) {
-                        break :blk StopReason.exited;
-                    } else if (W.IFSIGNALED(status)) {
-                        break :blk StopReason.terminated;
-                        // } else if (W.IFCONTINUED(status)) {
-                        //     break :blk StopReason.continued;
-                    } else {
-                        unreachable;
-                    }
-                },
-                .CHILD => WaitError.InvalidChild,
-                .INTR => WaitError.Interrupted,
-                else => unreachable,
-            };
-        },
-        else => unreachable,
-    }
-}
-
-pub fn cont(pid: i64) void {
-    _ = linux.ptrace(linux.PTRACE.CONT, @intCast(pid), 0, 0, 0);
-}
 
 const LaunchError = error{
     Busy,
@@ -68,7 +37,7 @@ const LaunchError = error{
     InvalidPath,
 };
 
-pub fn launch(exe_path: []const u8) !i64 {
+pub fn launch(exe_path: []const u8) !Process {
     switch (builtin.os.tag) {
         .linux => {
             var rc = linux.fork();
@@ -79,7 +48,7 @@ pub fn launch(exe_path: []const u8) !i64 {
                 .NOSYS => return LaunchError.Unsupported,
                 else => unreachable,
             }
-            const pid: i64 = @intCast(rc);
+            const pid: std.posix.pid_t = @intCast(rc);
 
             if (pid == 0) {
                 rc = linux.ptrace(linux.PTRACE.TRACEME, 0, 0, 0, 0);
@@ -120,17 +89,64 @@ pub fn launch(exe_path: []const u8) !i64 {
                 linux.exit(127);
             }
 
-            const stop_reason = try waitForStop(pid);
+            const process: Process = .{ .pid = pid, .handle = {}, .mem_fd = try openMem(pid), .breakpoints = &.{} };
+            const stop_reason = try waitForStop(&process);
             if (stop_reason != StopReason.stopped) { // TODO: Improve error handling to be clearer?
                 unreachable;
             }
             _ = linux.ptrace(linux.PTRACE.SETOPTIONS, @intCast(pid), 0, linux.PTRACE.O.EXITKILL, 0);
 
-            return pid;
+            return process;
         },
         else => unreachable,
     }
 }
+
+const StopReason = enum {
+    stopped,
+    exited,
+    continued,
+    terminated, // By a signal
+};
+
+const WaitError = error{
+    InvalidChild,
+    Interrupted,
+};
+
+pub fn waitForStop(self: *const Process) !StopReason {
+    switch (builtin.os.tag) {
+        .linux => {
+            var status: u32 = undefined;
+            const rc = linux.waitpid(self.pid, &status, 0);
+            return switch (std.posix.errno(rc)) {
+                .SUCCESS => blk: {
+                    const W = linux.W;
+                    if (W.IFSTOPPED(status)) {
+                        break :blk StopReason.stopped;
+                    } else if (W.IFEXITED(status)) {
+                        break :blk StopReason.exited;
+                    } else if (W.IFSIGNALED(status)) {
+                        break :blk StopReason.terminated;
+                        // } else if (W.IFCONTINUED(status)) {
+                        //     break :blk StopReason.continued;
+                    } else {
+                        unreachable;
+                    }
+                },
+                .CHILD => WaitError.InvalidChild,
+                .INTR => WaitError.Interrupted,
+                else => unreachable,
+            };
+        },
+        else => unreachable,
+    }
+}
+
+pub fn cont(self: *const Process) void {
+    _ = linux.ptrace(linux.PTRACE.CONT, self.pid, 0, 0, 0);
+}
+
 
 const RegsError = error{
     Fault,
@@ -155,16 +171,18 @@ pub fn readRegs(pid: i64) !GpRegs {
     };
 }
 
-pub fn readPc(pid: i64) !u64 {
-    const regs = try readRegs(pid);
+pub fn readPc(process: *const Process) !u64 {
+    const regs = try readRegs(process.pid);
     return regs.pc;
 }
-pub fn readSp(pid: i64) !u64 {
-    const regs = try readRegs(pid);
+
+pub fn readSp(process: *const Process) !u64 {
+    const regs = try readRegs(process.pid);
     return regs.sp;
 }
-pub fn readFp(pid: i64) !u64 {
-    const regs = try readRegs(pid);
+
+pub fn readFp(process: *const Process) !u64 {
+    const regs = try readRegs(process.pid);
     return regs.fp;
 }
 
@@ -204,3 +222,69 @@ const NativeRegs = extern struct {
     fs: c_ulong,
     gs: c_ulong,
 };
+
+fn openMem(pid: std.posix.pid_t) !std.posix.pid_t {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/mem", .{pid});
+    const rc = linux.open(path, .{ .ACCMODE = .RDWR }, 0);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+}
+
+pub fn readMem(self: *const Process, addr: u64, out_buffer: []u8) !void {
+    const rc = linux.pread(self.mem_fd, out_buffer.ptr, out_buffer.len, @intCast(addr));
+    // TODO: Check bytes read
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+}
+
+pub fn writeMem(self: *const Process, addr: u64, bytes: []const u8) !void {
+    const rc = linux.pwrite(self.mem_fd, bytes.ptr, bytes.len, @intCast(addr));
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+}
+
+pub fn writePc(self: *const Process, pc: u64) !void {
+    // TEST
+    const cur_pc = try self.readPc();
+    std.debug.assert(cur_pc == pc + 1);
+
+    const offset = @offsetOf(NativeRegs, "rip");
+    const rc = linux.ptrace(linux.PTRACE.POKEUSER, @intCast(self.pid), offset, @intCast(pc), 0);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |e| return std.posix.unexpectedErrno(e),
+    }
+}
+
+
+pub fn getBreakpoint(self: *const Process, addr: u64) ?Breakpoint {
+    for (self.breakpoints) |breakpoint| {
+        if (breakpoint.addr == addr) {
+            return breakpoint;
+        }
+    }
+    return null;
+}
+
+pub fn setBreakpoint(self: *const Process, addr: u64) !Breakpoint {
+    var orig: [1]u8 = undefined;
+    try self.readMem(addr, &orig);
+    try self.writeMem(addr, .{0xcc});
+}
+
+pub fn hideBreakpoint(self: *const Process, breakpoint: Breakpoint) !void {
+    const bytes: [1]u8 = .{ breakpoint.original_byte };
+    try self.writeMem(breakpoint.addr, &bytes);
+    try self.writePc(breakpoint.addr - 1);
+}
+
+pub fn resetBreakpoint(self: *const Process, breakpoint: Breakpoint) !void {
+    try self.writeMem(breakpoint.addr, .{0xcc});
+}
