@@ -1,8 +1,14 @@
 const std = @import("std");
 const linux = std.os.linux;
 const builtin = @import("builtin");
-const Process = @import("Process.zig");
+
 const DebugInfo = @import("DebugInfo.zig");
+const Process = @import("Process.zig");
+
+const log = std.log.scoped(.run_test);
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+};
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -33,7 +39,7 @@ pub fn traceInferior(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !
 
         switch (stop_reason) {
             .exited, .terminated => {
-                std.debug.print("StopReason = {s}\n", .{@tagName(stop_reason)});
+                log.info("StopReason = {s}", .{@tagName(stop_reason)});
                 break;
             },
             else => {},
@@ -44,7 +50,9 @@ pub fn traceInferior(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !
             try process.hideBreakpoint(bp);
         }
         const cu = debug_info.getUnit(addr);
-        std.debug.print("STOP AT: 0x{X}\n", .{addr});
+        const t = try debug_info.getLine(addr);
+        _ = t;
+        log.info("STOP AT: 0x{X}", .{addr});
         _ = cu;
         process.cont();
     }

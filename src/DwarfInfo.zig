@@ -19,6 +19,42 @@ const InitError = error{
     NoDwarf,
 };
 
+const Form = enum(u64) {
+    data1 = FORM.data1,
+    data2 = FORM.data2,
+    data4 = FORM.data4,
+    data8 = FORM.data8,
+    data16 = FORM.data16,
+    sdata = FORM.sdata,
+    udata = FORM.udata,
+    flag = FORM.flag,
+    flag_present = FORM.flag_present,
+    strp = FORM.strp,
+    line_strp = FORM.line_strp,
+    addr = FORM.addr,
+    ref_addr = FORM.ref_addr,
+    rnglistx = FORM.rnglistx,
+    block1 = FORM.block1,
+    block2 = FORM.block2,
+    block4 = FORM.block4,
+    block = FORM.block,
+    implicit_const = FORM.implicit_const,
+    sec_offset = FORM.sec_offset,
+    exprloc = FORM.exprloc,
+    _,
+};
+
+const Lnct = enum(u64) {
+    path = 0x1,
+    directory_index = 0x2,
+    timestamp = 0x3,
+    size = 0x4,
+    md5 = 0x5,
+    lo_user = 0x2000,
+    llvm_source = 0x2001,
+    hi_user = 0x3fff,
+};
+
 pub fn init(io: std.Io, gpa: std.mem.Allocator, binary_path: []const u8) !DwarfInfo {
     const arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     const bin_file = try std.Io.Dir.cwd().openFile(io, binary_path, .{});
@@ -70,6 +106,17 @@ pub fn getUnits(self: *DwarfInfo, allocator: std.mem.Allocator) ![]model.Unit {
         units[i] = .{ .offset = cu.die.offset, .name = "", .ranges = cu.ranges };
     }
     return units;
+}
+
+pub fn getCu(self: *DwarfInfo, addr: u64) ?*const Cu {
+    for (self.cus) |cu| {
+        for (cu.ranges) |range| {
+            if (range.low <= addr and addr <= range.high) {
+                return &cu;
+            }
+        }
+    }
+    return null;
 }
 
 const Cursor = struct {
@@ -136,10 +183,14 @@ const Cursor = struct {
         return self.data[self.offset..][0..size];
     }
 
-    fn sliceTo(self: *Cursor, end: u8) []const u8 {
-        const slice = std.mem.sliceTo(&self.data[self.offset], end);
+    fn sliceTo(self: *Cursor, comptime end: u8) []const u8 {
+        const slice = std.mem.sliceTo(self.data[self.offset..], end);
         self.offset += slice.len + 1; // + 1 for the end byte
         return slice;
+    }
+
+    fn skip(self: *Cursor, n: u64) void {
+        self.offset += n;
     }
 };
 
@@ -149,7 +200,7 @@ fn getSection(dwarf: *std.debug.Dwarf, section_id: SectionId) ?[]const u8 {
 
 const AbbrevAttr = struct {
     attr: u64,
-    form: u64,
+    form: Form,
     implicit_const: i64,
 };
 
@@ -186,12 +237,13 @@ fn readAbbrevEntry(self: *DwarfInfo, scratch: *std.ArrayList(AbbrevAttr), cursor
 
     while (true) {
         const attr = cursor.readUleb128();
-        const form = cursor.readUleb128();
+        const form_raw = cursor.readUleb128();
         var implicit_const: i64 = 0;
-        if (attr == 0 and form == 0) {
+        if (attr == 0 and form_raw == 0) {
             break;
         }
-        if (form == FORM.implicit_const) {
+        const form: Form = @enumFromInt(form_raw);
+        if (form == Form.implicit_const) {
             implicit_const = cursor.readSleb128();
         }
         try scratch.append(self.gpa, .{ .attr = attr, .form = form, .implicit_const = implicit_const });
@@ -357,26 +409,26 @@ fn readDie(
     };
 }
 
-fn readFormValue(cursor: *Cursor, form: u64, dwarf: ?*std.debug.Dwarf, header: ?*const CuHeader) !FormValue {
+fn readFormValue(cursor: *Cursor, form: Form, dwarf: ?*std.debug.Dwarf, header: ?*const CuHeader) !FormValue {
     const value: FormValue = switch (form) {
-        FORM.data1 => .{ .uint = cursor.readUBytes(1) },
-        FORM.data2 => .{ .uint = cursor.readUBytes(2) },
-        FORM.data4 => .{ .uint = cursor.readUBytes(4) },
-        FORM.data8 => .{ .uint = cursor.readUBytes(8) },
-        FORM.data16 => .{ .uint = cursor.readUBytes(16) },
-        FORM.sdata => .{ .int = cursor.readSleb128() },
-        FORM.udata => .{ .uint = cursor.readUleb128() },
-        FORM.flag => .{ .bool = cursor.readByte() != 0 },
-        FORM.flag_present => .{ .bool = true },
-        FORM.addr => .{ .ref_offset = cursor.readUBytes(header.?.addr_size) },
-        FORM.strp => .{ .str = cursor.readStrp(getSection(dwarf.?, SectionId.debug_line).?) },
-        FORM.line_strp => .{ .str = cursor.readStrp(getSection(dwarf.?, SectionId.debug_line_str).?) },
-        FORM.ref_addr, FORM.sec_offset => .{ .ref_offset = @intCast(cursor.readUBytes(header.?.dwarf_format_byte_count)) },
-        FORM.rnglistx => .{ .index = cursor.readUleb128() },
-        FORM.block1 => .{ .block = cursor.readBlock(1) },
-        FORM.block2 => .{ .block = cursor.readBlock(2) },
-        FORM.block4 => .{ .block = cursor.readBlock(4) },
-        FORM.block, FORM.exprloc => .{ .block = cursor.readBlock(cursor.readUleb128()) },
+        .data1 => .{ .uint = cursor.readUBytes(1) },
+        .data2 => .{ .uint = cursor.readUBytes(2) },
+        .data4 => .{ .uint = cursor.readUBytes(4) },
+        .data8 => .{ .uint = cursor.readUBytes(8) },
+        .data16 => .{ .uint = cursor.readUBytes(16) },
+        .sdata => .{ .int = cursor.readSleb128() },
+        .udata => .{ .uint = cursor.readUleb128() },
+        .flag => .{ .bool = cursor.readByte() != 0 },
+        .flag_present => .{ .bool = true },
+        .addr => .{ .ref_offset = cursor.readUBytes(header.?.addr_size) },
+        .strp => .{ .str = cursor.readStrp(getSection(dwarf.?, SectionId.debug_line).?) },
+        .line_strp => .{ .str = cursor.readStrp(getSection(dwarf.?, SectionId.debug_line_str).?) },
+        .ref_addr, .sec_offset => .{ .ref_offset = @intCast(cursor.readUBytes(header.?.dwarf_format_byte_count)) },
+        .rnglistx => .{ .index = cursor.readUleb128() },
+        .block1 => .{ .block = cursor.readBlock(1) },
+        .block2 => .{ .block = cursor.readBlock(2) },
+        .block4 => .{ .block = cursor.readBlock(4) },
+        .block, .exprloc => .{ .block = cursor.readBlock(cursor.readUleb128()) },
         else => return DwarfError.Unsupported,
     };
     return value;
@@ -405,8 +457,9 @@ fn readDieChildren(
 const Cu = struct {
     header: CuHeader,
     die: Die,
-    ranges: []const model.AddrRange,
     attrs: CuAttrs,
+    ranges: []const model.AddrRange,
+    lines_loaded: bool = false,
 };
 
 fn readCu(self: *DwarfInfo, cursor: *Cursor) !Cu {
@@ -631,21 +684,29 @@ const LineProgHeader = struct {
     header_length: u64,
     min_instruction_length: u8,
     max_ops_per_instruction: ?u8,
-    default_is_stmt: u8,
+    default_is_stmt: bool,
     line_base: i8,
     line_range: u8,
     opcode_base: u8,
     standard_opcode_lengths: []const u8, // Length is opcode_base - 1
+    program_start: u64, // NOTE: These values are relative to the header start and must be correct when executing the line program
+    program_end: u64, // NOTE: And this one
+    format: u8,
 };
 
-fn readLineProgHeader(self: *DwarfInfo, arena: std.mem.Allocator, cu: *const Cu) !LineProgHeader {
-    var cursor: Cursor = .{ .data = getSection(self.elf.dwarf.?, SectionId.debug_line), .offset = cu.attrs.stmt_list };
+fn readLineProgHeader(arena: std.mem.Allocator, cu: *const Cu, cursor: *Cursor) !LineProgHeader {
+    // TODO: Remove if unused
+    _ = cu;
+
     var unit_length = cursor.readUBytes(4);
+    var format: u8 = 4;
     var len_size: u8 = 4;
     if (unit_length == std.math.maxInt(u32)) {
         unit_length = cursor.readUBytes(8);
         len_size += 8;
+        format = 8;
     }
+    const program_end = cursor.offset + unit_length;
     const version: u16 = @intCast(cursor.readUBytes(2));
     var addr_size: ?u8 = null;
     var seg_selector_size: ?u8 = null;
@@ -653,15 +714,19 @@ fn readLineProgHeader(self: *DwarfInfo, arena: std.mem.Allocator, cu: *const Cu)
         addr_size = @intCast(cursor.readUBytes(1));
         seg_selector_size = @intCast(cursor.readUBytes(1));
     }
-    const header_length = cursor.readUBytes(cu.header.dwarf_format_byte_count);
+    const header_length = cursor.readUBytes(format);
+    const program_start = cursor.offset + header_length;
     const min_instruction_length: u8 = @intCast(cursor.readUBytes(1));
     const max_ops_per_instruction: u8 = @intCast(cursor.readUBytes(1));
-    const default_is_stmt: u8 = @intCast(cursor.readUBytes(1));
+    const default_is_stmt: bool = cursor.readByte() != 0;
     const line_base: i8 = @intCast(cursor.readBytes(1));
     const line_range: u8 = @intCast(cursor.readUBytes(1));
     const opcode_base: u8 = @intCast(cursor.readUBytes(1));
-    const standard_opcode_lengths = try arena.alloc(u8, opcode_base - 1);
-    @memcpy(standard_opcode_lengths, cursor.data[cursor.offset..][0..(opcode_base - 1)]);
+
+    const opcode_block_length = opcode_base - 1;
+    const standard_opcode_lengths = try arena.alloc(u8, opcode_block_length);
+    @memcpy(standard_opcode_lengths, cursor.data[cursor.offset..][0..opcode_block_length]);
+    cursor.skip(opcode_block_length);
 
     return .{
         .unit_length = unit_length,
@@ -676,75 +741,66 @@ fn readLineProgHeader(self: *DwarfInfo, arena: std.mem.Allocator, cu: *const Cu)
         .line_range = line_range,
         .opcode_base = opcode_base,
         .standard_opcode_lengths = standard_opcode_lengths,
+        .program_start = program_start,
+        .program_end = program_end,
+        .format = format,
     };
 }
 
-fn readLineProgDirsOld(header: *LineProgHeader, arena: std.mem.Allocator, data: []const u8, offset: *usize) ![]const u8 {
+fn readLineProgDirsOld(header: *const LineProgHeader, arena: std.mem.Allocator, cursor: *Cursor) ![]LineProgPath {
     std.debug.assert(header.version < 5);
-    var dirs: std.ArrayList([]const u8) = .empty;
+    var dirs: std.ArrayList(LineProgPath) = .empty;
     defer dirs.deinit(arena);
-    while (data[offset.*] != 0) {
-        const dir = std.mem.sliceTo(&data[offset.*], 0);
-        offset.* += dir.len;
-        try dirs.append(arena, dir);
+    while (cursor.peekByte() != 0) {
+        const dir = cursor.sliceTo(0);
+        try dirs.append(arena, .{ .path = dir });
     }
     return try dirs.toOwnedSlice(arena);
 }
 
-const LineProgEntry = struct {
+const LineProgPath = struct {
     path: []const u8 = &.{},
     dir_idx: ?u64 = null,
 };
 
-fn readLineProgFilesOld(header: *LineProgHeader, arena: std.mem.Allocator, cursor: *Cursor) ![]LineProgEntry {
+fn readLineProgFilesOld(header: *const LineProgHeader, arena: std.mem.Allocator, cursor: *Cursor) ![]LineProgPath {
     std.debug.assert(header.version >= 5);
-    var files: std.ArrayList(LineProgEntry) = .empty;
+    var files: std.ArrayList(LineProgPath) = .empty;
     defer files.deinit(arena);
     while (cursor.peekByte() != 0) {
         const filename = cursor.sliceTo(0);
         const dir_idx = cursor.readUleb128() - 1; // - 1 because it's 1-based indices
-        const mod_time = cursor.readUleb128();
-        const file_length = cursor.readUleb128();
-        try files.append(arena, .{ .path = filename, .dir_idx = dir_idx, .timestamp = mod_time, .size = file_length });
+        _ = cursor.readUleb128();
+        _ = cursor.readUleb128();
+        try files.append(arena, .{ .path = filename, .dir_idx = dir_idx });
     }
     return try files.toOwnedSlice(arena);
 }
 
 const LineProgPathFormatEntry = struct {
-    content_type: u8,
-    form: u8,
+    content_type: Lnct,
+    form: Form,
 };
 
-const LNCT = enum(u64) {
-    path = 0x1,
-    directory_index = 0x2,
-    timestamp = 0x3,
-    size = 0x4,
-    md5 = 0x5,
-    lo_user = 0x2000,
-    hi_user = 0x3fff,
-};
-
-fn readLineProgPathsNew(header: *LineProgHeader, arena: std.mem.Allocator, cursor: *Cursor) ![]LineProgEntry {
+fn readLineProgPathsNew(arena: std.mem.Allocator, cursor: *Cursor, cu_header: *const CuHeader, dwarf: *std.debug.Dwarf) ![]LineProgPath {
     const format_entry_count = cursor.readBytes(1);
     const max_format_entry_count = 8;
-    const format_entries = [max_format_entry_count]LineProgPathFormatEntry;
+    var format_entries: [max_format_entry_count]LineProgPathFormatEntry = undefined;
     std.debug.assert(format_entry_count <= max_format_entry_count);
-    for (0..format_entry_count) |i| {
-        const type_code = cursor.readBytes(1);
-        const form_code = cursor.readBytes(1);
-        format_entries[i] = .{ .content_type = type_code, .form = form_code };
+    for (0..@intCast(format_entry_count)) |i| {
+        const type_code = cursor.readUleb128();
+        const form_code = cursor.readUleb128();
+        format_entries[i] = .{ .content_type = @enumFromInt(type_code), .form = @enumFromInt(form_code) };
     }
-    _ = header;
 
     const entry_count = cursor.readUleb128();
-    const entries = try arena.alloc(LineProgEntry, entry_count);
+    const entries = try arena.alloc(LineProgPath, entry_count);
     for (0..entry_count) |i| {
-        for (0..format_entry_count) |u| {
-            const value = try readFormValue(cursor, null, null);
+        for (0..@intCast(format_entry_count)) |u| {
+            const value = try readFormValue(cursor, format_entries[u].form, dwarf, cu_header);
             switch (format_entries[u].content_type) {
-                LNCT.path => entries[i].path = value.str,
-                LNCT.directory_index => entries[i].dir_idx = value,
+                .path => entries[i].path = value.str,
+                .directory_index => entries[i].dir_idx = value.uint,
                 else => {},
             }
         }
@@ -752,15 +808,188 @@ fn readLineProgPathsNew(header: *LineProgHeader, arena: std.mem.Allocator, curso
     return entries;
 }
 
-// pub fn getLines(self: *DwarfInfo) ![]model.Line {
-//     const section = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_line)].?.data;
-//     _ = section;
-// }
+const LineProgRegs = struct {
+    address: u64,
+    op_index: u64,
+    file: u64,
+    line: u64,
+    column: u64,
+    isa: u64,
+    discriminator: u64,
+    is_stmt: bool,
+    end_sequence: bool,
+    basic_block: bool,
+    prologue_end: bool,
+    epilogue_begin: bool,
 
-const LCNT = enum(u8) {
-    path = 0x1,
-    directory_index = 0x2,
-    timestamp = 0x3,
-    size = 0x4,
-    md5 = 0x5,
+    fn initial(header: *const LineProgHeader) LineProgRegs {
+        return .{
+            .address = 0,
+            .op_index = 0,
+            .file = 1,
+            .line = 1,
+            .column = 0,
+            .isa = 0,
+            .is_stmt = header.default_is_stmt,
+            .end_sequence = false,
+            .discriminator = 0,
+            .basic_block = false,
+            .prologue_end = false,
+            .epilogue_begin = false,
+        };
+    }
+
+    fn resetFull(self: *LineProgRegs, header: *const LineProgHeader) void {
+        self.* = initial(header);
+    }
+
+    fn resetPostEmit(self: *LineProgRegs) void {
+        self.discriminator = 0;
+        self.basic_block = false;
+        self.prologue_end = false;
+        self.epilogue_begin = false;
+    }
+
+    fn emitLine(self: *LineProgRegs, allocator: std.mem.Allocator, dirs: []const LineProgPath, files: []const LineProgPath) !LineProgLine {
+        const filename = files[self.file].path;
+        const dirpath = dirs[files[self.file].dir_idx.?].path;
+        return .{
+            .addr = self.address,
+            .file = try std.fs.path.join(allocator, &.{ dirpath, filename }),
+            .line = self.line,
+            .column = self.column,
+            .prologue_end = self.prologue_end,
+            .end_sequence = self.end_sequence,
+            .is_stmt = self.is_stmt,
+        };
+    }
 };
+
+const LNS = enum(u8) {
+    extended_op = 0x0,
+    copy = 0x1,
+    advance_pc = 0x2,
+    advance_line = 0x3,
+    set_file = 0x4,
+    set_column = 0x5,
+    negate_stmt = 0x6,
+    set_basic_block = 0x7,
+    const_add_pc = 0x8,
+    fixed_advance_pc = 0x9,
+    set_prologue_end = 0xa,
+    set_epilogue_begin = 0xb,
+    set_isa = 0xc,
+};
+
+const LNE = enum(u8) {
+    end_sequence = 0x1,
+    set_address = 0x2,
+    define_file = 0x3,
+    set_discriminator = 0x4,
+    _,
+};
+
+const LineProgLine = struct {
+    addr: u64,
+    file: []const u8,
+    line: u64,
+    column: u64,
+    prologue_end: bool,
+    end_sequence: bool,
+    is_stmt: bool,
+};
+
+// NOTE: The cursor used here MUST have its offset relative to the start of the line program header for `program_end` to be correct
+fn executeLineProg(header: *const LineProgHeader, cu: *const Cu, gpa: std.mem.Allocator, arena: std.mem.Allocator, cursor: *Cursor, dirs: []const LineProgPath, files: []const LineProgPath) ![]LineProgLine {
+    var lines: std.ArrayList(LineProgLine) = .empty;
+    defer lines.deinit(gpa);
+    var regs: LineProgRegs = .initial(header);
+    const addr_size = header.addr_size orelse cu.header.addr_size;
+    while (cursor.offset != header.program_end) {
+        const opcode = cursor.readByte();
+        if (opcode == @intFromEnum(LNS.extended_op)) {
+            const len = cursor.readUleb128();
+            const sub_opcode = cursor.readByte();
+            const typed_sub_op: LNE = @enumFromInt(sub_opcode);
+            switch (typed_sub_op) {
+                .end_sequence => {
+                    regs.end_sequence = true;
+                    try lines.append(gpa, try regs.emitLine(arena, dirs, files));
+                    regs.resetFull(header);
+                },
+                .set_address => regs.address = cursor.readUBytes(addr_size),
+                .define_file => cursor.skip(len - 1),
+                .set_discriminator => regs.discriminator = cursor.readUleb128(),
+                else => cursor.skip(len - 1),
+            }
+        } else if (opcode < header.opcode_base) {
+            const typed_op: LNS = @enumFromInt(opcode);
+            switch (typed_op) {
+                .copy => {
+                    try lines.append(gpa, try regs.emitLine(arena, dirs, files));
+                    regs.resetPostEmit();
+                },
+                .advance_pc => regs.address += cursor.readUleb128() * header.min_instruction_length,
+                .advance_line => regs.line = @intCast(@as(i64, @intCast(regs.line)) + cursor.readSleb128()),
+                .set_file => regs.file = cursor.readUleb128(),
+                .set_column => regs.column = cursor.readUleb128(),
+                .negate_stmt => regs.is_stmt = !regs.is_stmt,
+                .set_basic_block => regs.basic_block = true,
+                .const_add_pc => regs.address += ((255 - header.opcode_base) / header.line_range) * header.min_instruction_length,
+                .fixed_advance_pc => regs.address = @intCast(@as(i64, @intCast(regs.address)) + cursor.readBytes(2)),
+                .set_prologue_end => regs.prologue_end = true,
+                .set_epilogue_begin => regs.epilogue_begin = true,
+                .set_isa => regs.isa = cursor.readUleb128(),
+                else => unreachable,
+            }
+        } else {
+            const opcode_rel = opcode - header.opcode_base;
+            const addr_adv = (opcode_rel / header.line_range) * header.min_instruction_length;
+            const line_adv = header.line_base + @as(i8, @intCast(opcode_rel % header.line_range));
+            regs.address += addr_adv;
+            regs.line = @intCast(@as(i64, @intCast(regs.line)) + line_adv);
+            try lines.append(gpa, try regs.emitLine(arena, dirs, files));
+            regs.resetPostEmit();
+        }
+    }
+
+    return try arena.dupe(LineProgLine, lines.items);
+}
+
+pub fn getLineRanges(self: *DwarfInfo, allocator: std.mem.Allocator, addr: u64) ![]model.Line {
+    var arena_allocator: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_allocator.deinit();
+    const arena = arena_allocator.allocator();
+    const section = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_line)].?.data;
+    const cu = self.getCu(addr) orelse return error.NotFound;
+    var cursor: Cursor = .{ .data = section, .offset = @intCast(cu.attrs.stmt_list.?) };
+
+    const header = try readLineProgHeader(arena, cu, &cursor);
+    var dirs: []LineProgPath = undefined;
+    var files: []LineProgPath = undefined;
+    switch (header.version) {
+        0...4 => {
+            dirs = try readLineProgDirsOld(&header, arena, &cursor);
+            files = try readLineProgFilesOld(&header, arena, &cursor);
+        },
+        5...6 => {
+            dirs = try readLineProgPathsNew(arena, &cursor, &cu.header, &self.elf.dwarf.?);
+            files = try readLineProgPathsNew(arena, &cursor, &cu.header, &self.elf.dwarf.?);
+        },
+        else => return DwarfError.Unsupported,
+    }
+    const lines = try executeLineProg(&header, cu, self.gpa, arena, &cursor, dirs, files);
+    var generic_lines: []model.Line = try allocator.alloc(model.Line, lines.len);
+    for (lines, 0..) |line, i| {
+        generic_lines[i] = .{
+            .addr = line.addr,
+            .line = line.line,
+            .column = line.column,
+            .file = try allocator.dupe(u8, line.file),
+            .is_stmt = line.is_stmt,
+            .end_sequence = line.end_sequence,
+            .prologue_end = line.prologue_end,
+        };
+    }
+    return generic_lines;
+}

@@ -7,14 +7,16 @@ pub const AddrRange = struct {
 
 pub const Line = struct {
     addr: u64,
-    file: []const u8,
     line: u64,
-    column: u32,
+    column: u64,
+    file: []const u8,
     is_stmt: bool,
+    prologue_end: bool,
+    end_sequence: bool,
 };
 
 pub const Unit = struct {
-    offset: u64, // Some debug format internal value (byte offset in DWARF)
+    offset: u64, // Some debug format internal value (e.g. byte offset in DWARF)
     name: []const u8,
     ranges: []const AddrRange,
 };

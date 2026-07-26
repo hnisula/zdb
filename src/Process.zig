@@ -225,7 +225,7 @@ const NativeRegs = extern struct {
 
 fn openMem(pid: std.posix.pid_t) !std.posix.pid_t {
     var path_buffer: [128]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "/proc/{d}/mem", .{pid});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "/proc/{d}/mem", .{pid}, 0);
     const rc = linux.open(path, .{ .ACCMODE = .RDWR }, 0);
     switch (std.posix.errno(rc)) {
         .SUCCESS => return @intCast(rc),

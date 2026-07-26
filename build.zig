@@ -1,11 +1,11 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const t = b.standardTargetOptions(.{});
+    const o = b.standardOptimizeOption(.{});
 
     // main
-    const main_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
+    const main_module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = t, .optimize = o });
     const zdb = b.addExecutable(.{ .name = "zdb", .root_module = main_module });
     b.installArtifact(zdb);
 
@@ -22,8 +22,8 @@ pub fn build(b: *std.Build) void {
     // samples
     const sample1_module = b.createModule(.{
         .root_source_file = b.path("src/dap/samples/sample1.zig"),
-        .target = target,
-        .optimize = optimize,
+        .target = t,
+        .optimize = o,
     });
     const sample1 = b.addExecutable(.{
         .name = "sample1",
@@ -34,8 +34,8 @@ pub fn build(b: *std.Build) void {
     // run-test
     const run_test_module = b.createModule(.{
         .root_source_file = b.path("src/run_test.zig"),
-        .target = target,
-        .optimize = optimize,
+        .target = t,
+        .optimize = o,
     });
     const run_test = b.addExecutable(.{
         .name = "run-test",
@@ -47,9 +47,9 @@ pub fn build(b: *std.Build) void {
     run_test_step.dependOn(&run_test_cmd.step);
 
     // check (separate modules so they don't collide with the emitting compiles)
-    const check_main = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
-    const check_sample1 = b.createModule(.{ .root_source_file = b.path("src/dap/samples/sample1.zig"), .target = target, .optimize = optimize });
-    const check_run_test = b.createModule(.{ .root_source_file = b.path("src/run_test.zig"), .target = target, .optimize = optimize });
+    const check_main = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = t, .optimize = o });
+    const check_sample1 = b.createModule(.{ .root_source_file = b.path("src/dap/samples/sample1.zig"), .target = t, .optimize = o });
+    const check_run_test = b.createModule(.{ .root_source_file = b.path("src/run_test.zig"), .target = t, .optimize = o });
 
     const check = b.step("check", "Analyze everything (no emit)");
     check.dependOn(&b.addExecutable(.{ .name = "check-zdb", .root_module = check_main }).step);
