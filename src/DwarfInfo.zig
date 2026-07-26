@@ -43,7 +43,8 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, binary_path: []const u8) !DwarfI
 
     while (dies.len > offset) {
         const cu_offset = offset;
-        const cu = try dwarf_info.readCu(dies, &offset);
+        var cursor: Cursor = .{ .data = dies, .offset = offset };
+        const cu = try dwarf_info.readCu(&cursor);
         // std.debug.print("CU offset: {x}\nCU size: {x}\nCU abbr_offset: {x}\nCU range count: {d}\n---\n", .{
         //     cu.header.offset,
         //     cu.header.unit_len,
@@ -71,55 +72,76 @@ pub fn getUnits(self: *DwarfInfo, allocator: std.mem.Allocator) ![]model.Unit {
     return units;
 }
 
-fn readUBytes(n: u8, data: []const u8, offset: *usize) u64 {
-    const value = std.mem.readVarInt(u64, data[offset.*..][0..n], builtin.cpu.arch.endian());
-    offset.* += n;
-    return value;
-}
+const Cursor = struct {
+    data: []const u8,
+    offset: usize,
 
-fn readBytes(n: u8, data: []const u8, offset: *usize) i64 {
-    const u_value = readUBytes(n, data, offset);
-    const shift: u6 = @intCast((8 - n) * 8);
-    return @as(i64, @bitCast(u_value << shift)) >> shift;
-}
+    fn peekByte(self: Cursor) u8 {
+        return self.data[self.offset];
+    }
 
-fn readSleb128(data: []const u8, offset: *usize) i64 {
-    var value: i64 = 0;
-    var shift: u6 = 0;
-    while (true) {
-        const byte = data[offset.*];
-        value |= @as(i64, byte & 0x7f) << shift;
-        offset.* += 1;
-        shift += 7;
-        if (byte & 0x80 == 0) {
-            return value;
+    fn readByte(self: *Cursor) u8 {
+        const value = self.data[self.offset];
+        self.offset += 1;
+        return value;
+    }
+
+    fn readUBytes(self: *Cursor, n: u8) u64 {
+        const value = std.mem.readVarInt(u64, self.data[self.offset..][0..n], builtin.cpu.arch.endian());
+        self.offset += n;
+        return value;
+    }
+
+    fn readBytes(self: *Cursor, n: u8) i64 {
+        const u_value = self.readUBytes(n);
+        const shift: u6 = @intCast((8 - n) * 8);
+        return @as(i64, @bitCast(u_value << shift)) >> shift;
+    }
+
+    fn readSleb128(self: *Cursor) i64 {
+        var value: i64 = 0;
+        var shift: u6 = 0;
+        while (true) {
+            const byte = self.data[self.offset];
+            value |= @as(i64, byte & 0x7f) << shift;
+            self.offset += 1;
+            shift += 7;
+            if (byte & 0x80 == 0) {
+                return value;
+            }
         }
     }
-}
 
-fn readUleb128(data: []const u8, offset: *usize) u64 {
-    var value: u64 = 0;
-    var shift: u6 = 0;
-    while (true) {
-        const byte = data[offset.*];
-        value |= @as(u64, byte & 0x7f) << shift;
-        offset.* += 1;
-        shift += 7;
-        if (byte & 0x80 == 0) {
-            return value;
+    fn readUleb128(self: *Cursor) u64 {
+        var value: u64 = 0;
+        var shift: u6 = 0;
+        while (true) {
+            const byte = self.data[self.offset];
+            value |= @as(u64, byte & 0x7f) << shift;
+            self.offset += 1;
+            shift += 7;
+            if (byte & 0x80 == 0) {
+                return value;
+            }
         }
     }
-}
 
-fn readStrp(data: []const u8, offset: *usize, str_section: []const u8) []const u8 {
-    const str_offset = readUBytes(4, data, offset);
-    return std.mem.sliceTo(str_section[str_offset..], 0);
-}
+    fn readStrp(self: *Cursor, str_section: []const u8) []const u8 {
+        const str_offset = self.readUBytes(4);
+        return std.mem.sliceTo(str_section[str_offset..], 0);
+    }
 
-fn readBlock(size: u64, data: []const u8, offset: *usize) []const u8 {
-    offset.* += size;
-    return data[offset.*..][0..size];
-}
+    fn readBlock(self: *Cursor, size: u64) []const u8 {
+        self.offset += size;
+        return self.data[self.offset..][0..size];
+    }
+
+    fn sliceTo(self: *Cursor, end: u8) []const u8 {
+        const slice = std.mem.sliceTo(&self.data[self.offset], end);
+        self.offset += slice.len + 1; // + 1 for the end byte
+        return slice;
+    }
+};
 
 fn getSection(dwarf: *std.debug.Dwarf, section_id: SectionId) ?[]const u8 {
     return dwarf.sections[@intFromEnum(section_id)].?.data;
@@ -154,24 +176,23 @@ const CompileUnit = struct {
     has_children: bool,
 };
 
-fn readAbbrevEntry(self: *DwarfInfo, scratch: *std.ArrayList(AbbrevAttr), data: []const u8, offset: *usize) !Abbrev {
-    const code = readUleb128(data, offset);
+fn readAbbrevEntry(self: *DwarfInfo, scratch: *std.ArrayList(AbbrevAttr), cursor: *Cursor) !Abbrev {
+    const code = cursor.readUleb128();
     if (code == 0) {
         return .{ .code = code, .tag = 0, .has_children = false, .attributes = &.{} };
     }
-    const tag = readUleb128(data, offset);
-    const has_children = data[offset.*] != 0;
-    offset.* += 1;
+    const tag = cursor.readUleb128();
+    const has_children: bool = cursor.readByte() != 0;
 
     while (true) {
-        const attr = readUleb128(data, offset);
-        const form = readUleb128(data, offset);
+        const attr = cursor.readUleb128();
+        const form = cursor.readUleb128();
         var implicit_const: i64 = 0;
         if (attr == 0 and form == 0) {
             break;
         }
         if (form == FORM.implicit_const) {
-            implicit_const = readSleb128(data, offset);
+            implicit_const = cursor.readSleb128();
         }
         try scratch.append(self.gpa, .{ .attr = attr, .form = form, .implicit_const = implicit_const });
     }
@@ -192,19 +213,19 @@ fn readAbbrevEntry(self: *DwarfInfo, scratch: *std.ArrayList(AbbrevAttr), data: 
 fn getOrParseAbbrevs(self: *DwarfInfo, table: u64) !*std.AutoHashMapUnmanaged(u64, Abbrev) {
     const result = try self.abbrevs.getOrPut(self.arena.allocator(), table);
     if (!result.found_existing) {
-        var offset = table;
         const debug_abbrev = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_abbrev)].?.data;
         result.value_ptr.* = .empty;
-        try self.readAbbrevs(result.value_ptr, debug_abbrev, &offset);
+        var cursor: Cursor = .{ .data = debug_abbrev, .offset = @intCast(table) };
+        try self.readAbbrevs(result.value_ptr, &cursor);
     }
     return result.value_ptr;
 }
 
-fn readAbbrevs(self: *DwarfInfo, map: *std.AutoHashMapUnmanaged(u64, Abbrev), data: []const u8, offset: *usize) !void {
+fn readAbbrevs(self: *DwarfInfo, map: *std.AutoHashMapUnmanaged(u64, Abbrev), cursor: *Cursor) !void {
     var attr_scratch: std.ArrayList(AbbrevAttr) = try .initCapacity(self.gpa, 36);
     defer attr_scratch.deinit(self.gpa);
     while (true) {
-        const abbrev = try self.readAbbrevEntry(&attr_scratch, data, offset);
+        const abbrev = try self.readAbbrevEntry(&attr_scratch, cursor);
         if (abbrev.code == 0) {
             break;
         }
@@ -212,36 +233,30 @@ fn readAbbrevs(self: *DwarfInfo, map: *std.AutoHashMapUnmanaged(u64, Abbrev), da
     }
 }
 
-fn readCuHeader(data: []const u8, offset: *usize) CuHeader {
-    const endian = builtin.cpu.arch.endian();
-    const header_start = offset.*;
-    var unit_len: u64 = @intCast(std.mem.readInt(u32, data[offset.*..][0..4], endian));
+fn readCuHeader(cursor: *Cursor) CuHeader {
+    const header_start = cursor.offset;
+    var unit_len = cursor.readUBytes(4);
     var len_size: u8 = 4;
     var format: u8 = 4;
-    offset.* += 4;
     var header_len: u64 = 4 + 2 + 1 + 1 + 4;
     if (unit_len == std.math.maxInt(u32)) {
-        unit_len = std.mem.readInt(u64, data[offset.*..][0..8], endian);
-        offset.* += 8;
+        unit_len = cursor.readUBytes(8);
         header_len += 8;
         len_size += 8;
         format = 8;
     }
-    const version = std.mem.readInt(u16, data[offset.*..][0..2], endian);
-    offset.* += 2;
+    const version: u16 = @intCast(cursor.readUBytes(2));
 
     var unit_type: u8 = undefined;
     var addr_size: u8 = undefined;
     var debug_abbrev_offset: u32 = undefined;
-    if (version == 5) {
-        unit_type = data[offset.* + 0];
-        addr_size = data[offset.* + 1];
-        debug_abbrev_offset = std.mem.readInt(u32, data[offset.* + 2 ..][0..4], endian);
-        offset.* += 1 + 1 + 4;
+    if (version >= 5) {
+        unit_type = cursor.readByte();
+        addr_size = cursor.readByte();
+        debug_abbrev_offset = @intCast(cursor.readUBytes(4));
     } else {
-        debug_abbrev_offset = std.mem.readInt(u32, data[offset.* + 0 ..][0..4], endian);
-        addr_size = data[offset.* + 4];
-        offset.* += 4 + 1;
+        debug_abbrev_offset = @intCast(cursor.readUBytes(4));
+        addr_size = cursor.readByte();
     }
     return .{
         .offset = header_start,
@@ -300,12 +315,11 @@ fn readDie(
     self: *DwarfInfo,
     context: *ParseContext,
     abbrevs: *const std.AutoHashMapUnmanaged(u64, Abbrev),
-    data: []const u8,
-    offset: *usize,
+    cursor: *Cursor,
     parse_children: bool,
 ) (DwarfError || std.mem.Allocator.Error)!?Die {
-    const die_offset = offset.*;
-    const abbrev_code = readUleb128(data, offset);
+    const die_offset = cursor.offset;
+    const abbrev_code = cursor.readUleb128();
     if (abbrev_code == 0) {
         return null;
     }
@@ -313,7 +327,7 @@ fn readDie(
 
     // attributes
     for (abbrev.attributes) |abbrev_attr| {
-        const value = try readFormValue(data, offset, abbrev_attr.form, &self.elf.dwarf.?, context.cu_header);
+        const value = try readFormValue(cursor, abbrev_attr.form, &self.elf.dwarf.?, context.cu_header);
         var attr = try context.attr_scratch.addOneBounded();
         attr.attr = abbrev_attr.attr;
         attr.value = value;
@@ -325,12 +339,12 @@ fn readDie(
     context.attr_scratch.clearRetainingCapacity();
 
     // children
-    const child_offset = offset.*;
+    const child_offset = cursor.offset;
     var children: ?[]const Die = null;
     if (!abbrev.has_children) {
         children = &.{};
     } else if (parse_children and abbrev.has_children) {
-        children = try self.readDieChildren(context, abbrevs, data, child_offset);
+        children = try self.readDieChildren(context, abbrevs, cursor.data, child_offset);
     }
 
     return .{
@@ -343,26 +357,26 @@ fn readDie(
     };
 }
 
-fn readFormValue(data: []const u8, offset: *usize, form: u64, dwarf: ?*std.debug.Dwarf, header: ?*const CuHeader) !FormValue {
+fn readFormValue(cursor: *Cursor, form: u64, dwarf: ?*std.debug.Dwarf, header: ?*const CuHeader) !FormValue {
     const value: FormValue = switch (form) {
-        FORM.data1 => .{ .uint = readUBytes(1, data, offset) },
-        FORM.data2 => .{ .uint = readUBytes(2, data, offset) },
-        FORM.data4 => .{ .uint = readUBytes(4, data, offset) },
-        FORM.data8 => .{ .uint = readUBytes(8, data, offset) },
-        FORM.data16 => .{ .uint = readUBytes(16, data, offset) },
-        FORM.sdata => .{ .int = readSleb128(data, offset) },
-        FORM.udata => .{ .uint = readUleb128(data, offset) },
-        FORM.flag => .{ .bool = readUBytes(1, data, offset) != 0 },
+        FORM.data1 => .{ .uint = cursor.readUBytes(1) },
+        FORM.data2 => .{ .uint = cursor.readUBytes(2) },
+        FORM.data4 => .{ .uint = cursor.readUBytes(4) },
+        FORM.data8 => .{ .uint = cursor.readUBytes(8) },
+        FORM.data16 => .{ .uint = cursor.readUBytes(16) },
+        FORM.sdata => .{ .int = cursor.readSleb128() },
+        FORM.udata => .{ .uint = cursor.readUleb128() },
+        FORM.flag => .{ .bool = cursor.readByte() != 0 },
         FORM.flag_present => .{ .bool = true },
-        FORM.addr => .{ .ref_offset = readUBytes(header.?.addr_size, data, offset) },
-        FORM.strp => .{ .str = readStrp(data, offset, getSection(dwarf.?, SectionId.debug_line).?) },
-        FORM.line_strp => .{ .str = readStrp(data, offset, getSection(dwarf.?, SectionId.debug_line_str).?) },
-        FORM.ref_addr, FORM.sec_offset => .{ .ref_offset = @intCast(readUBytes(header.?.dwarf_format_byte_count, data, offset)) },
-        FORM.rnglistx => .{ .index = readUleb128(data, offset) },
-        FORM.block1 => .{ .block = readBlock(1, data, offset) },
-        FORM.block2 => .{ .block = readBlock(2, data, offset) },
-        FORM.block4 => .{ .block = readBlock(4, data, offset) },
-        FORM.block, FORM.exprloc => .{ .block = readBlock(readUleb128(data, offset), data, offset) },
+        FORM.addr => .{ .ref_offset = cursor.readUBytes(header.?.addr_size) },
+        FORM.strp => .{ .str = cursor.readStrp(getSection(dwarf.?, SectionId.debug_line).?) },
+        FORM.line_strp => .{ .str = cursor.readStrp(getSection(dwarf.?, SectionId.debug_line_str).?) },
+        FORM.ref_addr, FORM.sec_offset => .{ .ref_offset = @intCast(cursor.readUBytes(header.?.dwarf_format_byte_count)) },
+        FORM.rnglistx => .{ .index = cursor.readUleb128() },
+        FORM.block1 => .{ .block = cursor.readBlock(1) },
+        FORM.block2 => .{ .block = cursor.readBlock(2) },
+        FORM.block4 => .{ .block = cursor.readBlock(4) },
+        FORM.block, FORM.exprloc => .{ .block = cursor.readBlock(cursor.readUleb128()) },
         else => return DwarfError.Unsupported,
     };
     return value;
@@ -376,8 +390,8 @@ fn readDieChildren(
     child_offset: u64,
 ) ![]const Die {
     const child_mark = context.die_scratch.items.len;
-    var offset = child_offset;
-    while (try self.readDie(context, abbrevs, data, &offset, true)) |child| {
+    var cursor: Cursor = .{ .data = data, .offset = child_offset };
+    while (try self.readDie(context, abbrevs, &cursor, true)) |child| {
         try context.die_scratch.append(self.gpa, child);
     }
     const child_count = context.die_scratch.items.len - child_mark;
@@ -395,8 +409,8 @@ const Cu = struct {
     attrs: CuAttrs,
 };
 
-fn readCu(self: *DwarfInfo, data: []const u8, offset: *usize) !Cu {
-    const header = readCuHeader(data, offset);
+fn readCu(self: *DwarfInfo, cursor: *Cursor) !Cu {
+    const header = readCuHeader(cursor);
     const abbrevs = try self.getOrParseAbbrevs(header.debug_abbrev_offset);
 
     var context: ParseContext = .{
@@ -406,7 +420,7 @@ fn readCu(self: *DwarfInfo, data: []const u8, offset: *usize) !Cu {
     };
     defer context.attr_scratch.deinit(self.gpa);
     defer context.die_scratch.deinit(self.gpa);
-    const die = try self.readDie(&context, abbrevs, data, offset, false) orelse return DwarfError.Unknown;
+    const die = try self.readDie(&context, abbrevs, cursor, false) orelse return DwarfError.Unknown;
     const cu_attrs = getCuBaseAttrs(&die);
 
     var cu: Cu = .{
@@ -474,45 +488,30 @@ fn resolveRanges(self: *DwarfInfo, cu: *const Cu, attrs: []const Attribute) ![]c
                     .index => |index| {
                         // dwarf 5 -> debug_rnglists (with rnglists_base and index/offset size)
                         std.debug.assert(cu.header.version >= 5);
-                        const section = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_rnglists)].?.data;
-                        var table_index: usize = cu.attrs.rnglists_base.? + index * cu.header.dwarf_format_byte_count;
-                        var list_offset = cu.attrs.rnglists_base.? + readUBytes(cu.header.dwarf_format_byte_count, section, &table_index);
-                        const offset = &list_offset;
-                        const attr_ranges = try self.readRangeListNew(
-                            cu,
-                            section,
-                            offset,
-                        );
+                        const section = getSection(&self.elf.dwarf.?, SectionId.debug_rnglists);
+                        const table_index: usize = cu.attrs.rnglists_base.? + index * cu.header.dwarf_format_byte_count;
+                        var table_cursor: Cursor = .{ .data = section.?, .offset = table_index };
+                        const list_offset = cu.attrs.rnglists_base.? + table_cursor.readUBytes(cu.header.dwarf_format_byte_count);
+                        var range_cursor: Cursor = .{ .data = section.?, .offset = list_offset };
+                        const attr_ranges = try self.readRangeListNew(cu, &range_cursor);
                         try ranges.appendSlice(self.gpa, attr_ranges);
                     },
                     .ref_offset => |ref_offset| {
                         // if dwarf 5 -> .debug_rnglists, else if dwarf <5 -> .debug_ranges
                         const attr_ranges = if (cu.header.version == 5) blk: {
-                            var offset = ref_offset;
-                            break :blk try self.readRangeListNew(
-                                cu,
-                                self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_rnglists)].?.data,
-                                &offset,
-                            );
+                            var cursor: Cursor = .{ .data = getSection(&self.elf.dwarf.?, SectionId.debug_rnglists).?, .offset = ref_offset };
+                            break :blk try self.readRangeListNew(cu, &cursor);
                         } else blk: {
-                            var offset = ref_offset;
-                            break :blk try self.readRangeListOld(
-                                cu,
-                                self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_ranges)].?.data,
-                                &offset,
-                            );
+                            var cursor: Cursor = .{ .data = getSection(&self.elf.dwarf.?, SectionId.debug_ranges).?, .offset = ref_offset };
+                            break :blk try self.readRangeListOld(cu, &cursor);
                         };
                         try ranges.appendSlice(self.gpa, attr_ranges);
                     },
                     .uint => |uint| {
                         // dwarf 2/3 but same as previous prong's DWARF 4 version (direct offset)
                         std.debug.assert(cu.header.version < 5);
-                        var offset = uint;
-                        const attr_ranges = try self.readRangeListOld(
-                            cu,
-                            self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_ranges)].?.data,
-                            &offset,
-                        );
+                        var cursor: Cursor = .{ .data = getSection(&self.elf.dwarf.?, SectionId.debug_ranges).?, .offset = uint };
+                        const attr_ranges = try self.readRangeListOld(cu, &cursor);
                         try ranges.appendSlice(self.gpa, attr_ranges);
                     },
                     else => return DwarfError.Unsupported,
@@ -528,13 +527,12 @@ fn resolveRanges(self: *DwarfInfo, cu: *const Cu, attrs: []const Attribute) ![]c
 }
 
 // Handles the DWARF 5+ .debug_rnglists
-fn readRangeListNew(self: *DwarfInfo, cu: *const Cu, data: []const u8, offset: *usize) ![]const model.AddrRange {
+fn readRangeListNew(self: *DwarfInfo, cu: *const Cu, cursor: *Cursor) ![]const model.AddrRange {
     const debug_addr = if (self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_addr)]) |section| section.data else null;
     var range_scratch: std.ArrayList(model.AddrRange) = .empty;
     defer range_scratch.deinit(self.gpa);
     var base = cu.attrs.low_pc;
-    var code = data[offset.*];
-    offset.* += 1;
+    var code = cursor.readByte();
 
     while (code != RLE.end_of_list) {
         var start: u64 = 0;
@@ -542,47 +540,50 @@ fn readRangeListNew(self: *DwarfInfo, cu: *const Cu, data: []const u8, offset: *
 
         switch (code) {
             RLE.start_length => {
-                start = readUBytes(cu.header.addr_size, data, offset);
-                end = start + readUleb128(data, offset);
+                start = cursor.readUBytes(cu.header.addr_size);
+                end = start + cursor.readUleb128();
             },
             RLE.start_end => {
-                start = readUBytes(cu.header.addr_size, data, offset);
-                end = readUBytes(cu.header.addr_size, data, offset);
+                start = cursor.readUBytes(cu.header.addr_size);
+                end = cursor.readUBytes(cu.header.addr_size);
             },
             RLE.offset_pair => {
                 std.debug.assert(base != null);
-                start = base.? + readUleb128(data, offset);
-                end = base.? + readUleb128(data, offset);
+                start = base.? + cursor.readUleb128();
+                end = base.? + cursor.readUleb128();
             },
             RLE.startx_length => {
                 std.debug.assert(debug_addr != null);
-                var startx = readUleb128(data, offset);
-                const length = readUleb128(data, offset);
-                start = readUBytes(cu.header.addr_size, debug_addr.?, &startx);
+                const startx = cursor.readUleb128();
+                const length = cursor.readUleb128();
+                var addr_cursor: Cursor = .{ .data = debug_addr.?, .offset = startx };
+                start = addr_cursor.readUBytes(cu.header.addr_size);
                 end = start + length;
             },
             RLE.startx_endx => {
                 std.debug.assert(debug_addr != null);
-                var startx = readUleb128(data, offset);
-                var endx = readUleb128(data, offset);
-                start = readUBytes(cu.header.addr_size, debug_addr.?, &startx);
-                end = readUBytes(cu.header.addr_size, debug_addr.?, &endx);
+                const startx = cursor.readUleb128();
+                const endx = cursor.readUleb128();
+                var start_cursor: Cursor = .{ .data = debug_addr.?, .offset = startx };
+                start = start_cursor.readUBytes(cu.header.addr_size);
+                var end_cursor: Cursor = .{ .data = debug_addr.?, .offset = endx };
+                end = end_cursor.readUBytes(cu.header.addr_size);
             },
             RLE.base_address => {
-                base = readUBytes(cu.header.addr_size, data, offset);
+                base = cursor.readUBytes(cu.header.addr_size);
             },
             RLE.base_addressx => {
                 std.debug.assert(debug_addr != null);
-                var addr_offset = cu.attrs.addr_base.? + readUleb128(data, offset) * cu.header.addr_size;
-                base = readUBytes(cu.header.addr_size, debug_addr.?, &addr_offset);
+                const addr_offset = cu.attrs.addr_base.? + cursor.readUleb128() * cu.header.addr_size;
+                var addr_cursor: Cursor = .{ .data = debug_addr.?, .offset = addr_offset };
+                base = addr_cursor.readUBytes(cu.header.addr_size);
             },
             else => return DwarfError.Unsupported,
         }
 
         const addr_range = try range_scratch.addOne(self.gpa);
         addr_range.* = .{ .low = start, .high = end };
-        code = data[offset.*];
-        offset.* += 1;
+        code = cursor.readByte();
     }
 
     if (range_scratch.items.len == 0) {
@@ -593,12 +594,12 @@ fn readRangeListNew(self: *DwarfInfo, cu: *const Cu, data: []const u8, offset: *
 }
 
 // Handles the DWARF <5 .debug_ranges
-fn readRangeListOld(self: *DwarfInfo, cu: *const Cu, data: []const u8, offset: *usize) ![]const model.AddrRange {
+fn readRangeListOld(self: *DwarfInfo, cu: *const Cu, cursor: *Cursor) ![]const model.AddrRange {
     var range_scratch: std.ArrayList(model.AddrRange) = .empty;
     defer range_scratch.deinit(self.gpa);
     var base = cu.attrs.low_pc.?;
-    var first = readUBytes(cu.header.addr_size, data, offset);
-    var second = readUBytes(cu.header.addr_size, data, offset);
+    var first = cursor.readUBytes(cu.header.addr_size);
+    var second = cursor.readUBytes(cu.header.addr_size);
 
     while (first != 0 and second != 0) {
         std.debug.assert(cu.header.addr_size == 4 or cu.header.addr_size == 8);
@@ -611,8 +612,8 @@ fn readRangeListOld(self: *DwarfInfo, cu: *const Cu, data: []const u8, offset: *
         const addr_range = try range_scratch.addOne(self.gpa);
         addr_range.* = .{ .low = base + first, .high = base + second };
 
-        first = readUBytes(cu.header.addr_size, data, offset);
-        second = readUBytes(cu.header.addr_size, data, offset);
+        first = cursor.readUBytes(cu.header.addr_size);
+        second = cursor.readUBytes(cu.header.addr_size);
     }
 
     if (range_scratch.items.len == 0) {
@@ -638,30 +639,29 @@ const LineProgHeader = struct {
 };
 
 fn readLineProgHeader(self: *DwarfInfo, arena: std.mem.Allocator, cu: *const Cu) !LineProgHeader {
-    const data = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_line)].?.data;
-    var offset: usize = @intCast(cu.stmt_list.?);
-    var unit_length = readUBytes(4, data, &offset);
+    var cursor: Cursor = .{ .data = getSection(self.elf.dwarf.?, SectionId.debug_line), .offset = cu.attrs.stmt_list };
+    var unit_length = cursor.readUBytes(4);
     var len_size: u8 = 4;
     if (unit_length == std.math.maxInt(u32)) {
-        unit_length = readUBytes(8, data, &offset);
+        unit_length = cursor.readUBytes(8);
         len_size += 8;
     }
-    const version: u16 = @intCast(readUBytes(2, data, &offset));
+    const version: u16 = @intCast(cursor.readUBytes(2));
     var addr_size: ?u8 = null;
     var seg_selector_size: ?u8 = null;
     if (version >= 5) {
-        addr_size = @intCast(readUBytes(1, data, &offset));
-        seg_selector_size = @intCast(readUBytes(1, data, &offset));
+        addr_size = @intCast(cursor.readUBytes(1));
+        seg_selector_size = @intCast(cursor.readUBytes(1));
     }
-    const header_length = readUBytes(cu.header.dwarf_format_byte_count, data, &offset);
-    const min_instruction_length: u8 = @intCast(readUBytes(1, data, &offset));
-    const max_ops_per_instruction: u8 = @intCast(readUBytes(1, data, &offset));
-    const default_is_stmt: u8 = @intCast(readUBytes(1, data, &offset));
-    const line_base: i8 = @intCast(readBytes(1, data, &offset));
-    const line_range: u8 = @intCast(readUBytes(1, data, &offset));
-    const opcode_base: u8 = @intCast(readUBytes(1, data, &offset));
+    const header_length = cursor.readUBytes(cu.header.dwarf_format_byte_count);
+    const min_instruction_length: u8 = @intCast(cursor.readUBytes(1));
+    const max_ops_per_instruction: u8 = @intCast(cursor.readUBytes(1));
+    const default_is_stmt: u8 = @intCast(cursor.readUBytes(1));
+    const line_base: i8 = @intCast(cursor.readBytes(1));
+    const line_range: u8 = @intCast(cursor.readUBytes(1));
+    const opcode_base: u8 = @intCast(cursor.readUBytes(1));
     const standard_opcode_lengths = try arena.alloc(u8, opcode_base - 1);
-    @memcpy(standard_opcode_lengths, data[offset..][0..(opcode_base - 1)]);
+    @memcpy(standard_opcode_lengths, cursor.data[cursor.offset..][0..(opcode_base - 1)]);
 
     return .{
         .unit_length = unit_length,
@@ -696,16 +696,15 @@ const LineProgEntry = struct {
     dir_idx: ?u64 = null,
 };
 
-fn readLineProgFilesOld(header: *LineProgHeader, arena: std.mem.Allocator, data: []const u8, offset: *usize) ![]LineProgEntry {
+fn readLineProgFilesOld(header: *LineProgHeader, arena: std.mem.Allocator, cursor: *Cursor) ![]LineProgEntry {
     std.debug.assert(header.version >= 5);
     var files: std.ArrayList(LineProgEntry) = .empty;
     defer files.deinit(arena);
-    while (data[offset.*] != 0) {
-        const filename = std.mem.sliceTo(&data[offset.*], 0);
-        offset.* += filename.len + 1;
-        const dir_idx = readUleb128(data, offset) - 1; // - 1 because it's 1-based indices
-        const mod_time = readUleb128(data, offset);
-        const file_length = readUleb128(data, offset);
+    while (cursor.peekByte() != 0) {
+        const filename = cursor.sliceTo(0);
+        const dir_idx = cursor.readUleb128() - 1; // - 1 because it's 1-based indices
+        const mod_time = cursor.readUleb128();
+        const file_length = cursor.readUleb128();
         try files.append(arena, .{ .path = filename, .dir_idx = dir_idx, .timestamp = mod_time, .size = file_length });
     }
     return try files.toOwnedSlice(arena);
@@ -726,23 +725,23 @@ const LNCT = enum(u64) {
     hi_user = 0x3fff,
 };
 
-fn readLineProgPathsNew(header: *LineProgHeader, arena: std.mem.Allocator, data: []const u8, offset: *usize) ![]LineProgEntry {
-    const format_entry_count = readBytes(1, data, offset);
+fn readLineProgPathsNew(header: *LineProgHeader, arena: std.mem.Allocator, cursor: *Cursor) ![]LineProgEntry {
+    const format_entry_count = cursor.readBytes(1);
     const max_format_entry_count = 8;
     const format_entries = [max_format_entry_count]LineProgPathFormatEntry;
     std.debug.assert(format_entry_count <= max_format_entry_count);
     for (0..format_entry_count) |i| {
-        const type_code = readBytes(1, data, offset);
-        const form_code = readBytes(1, data, offset);
+        const type_code = cursor.readBytes(1);
+        const form_code = cursor.readBytes(1);
         format_entries[i] = .{ .content_type = type_code, .form = form_code };
     }
     _ = header;
 
-    const entry_count = readUleb128(data, offset);
+    const entry_count = cursor.readUleb128();
     const entries = try arena.alloc(LineProgEntry, entry_count);
     for (0..entry_count) |i| {
         for (0..format_entry_count) |u| {
-            const value = try readFormValue(data, offset, null, null);
+            const value = try readFormValue(cursor, null, null);
             switch (format_entries[u].content_type) {
                 LNCT.path => entries[i].path = value.str,
                 LNCT.directory_index => entries[i].dir_idx = value,
