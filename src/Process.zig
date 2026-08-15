@@ -5,11 +5,15 @@ const linux = std.os.linux;
 
 const Process = @This();
 
+const log = std.log.scoped(.process);
+
 pid: if (builtin.os.tag == .windows) u32 else std.posix.pid_t,
 handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void,
 mem_fd: if (builtin.os.tag == .windows) void else std.posix.fd_t,
 
 breakpoints: []const Breakpoint,
+
+bp_to_restore: ?Breakpoint = null,
 
 const Breakpoint = struct {
     addr: u64,
@@ -143,10 +147,14 @@ pub fn waitForStop(self: *const Process) !StopReason {
     }
 }
 
-pub fn cont(self: *const Process) void {
+pub fn cont(self: *Process) !void {
+    // TODO: This ordering will fail, FIX!
+    if (self.bp_to_restore) |bp| {
+        try self.resetBreakpoint(bp);
+        self.bp_to_restore = null;
+    }
     _ = linux.ptrace(linux.PTRACE.CONT, self.pid, 0, 0, 0);
 }
-
 
 const RegsError = error{
     Fault,
@@ -156,6 +164,40 @@ const RegsError = error{
     NoStoppedProcess,
     Unknown,
 };
+
+const StopSignal = enum {
+    breakpoint,
+    trace,
+    branch,
+    hardware,
+    unknown,
+};
+
+const PtraceError = error{
+    Unknown,
+};
+
+pub fn getStopSignal(self: *const Process) !StopSignal {
+    var sig_info: linux.siginfo_t = undefined;
+    const rc = linux.ptrace(linux.PTRACE.GETSIGINFO, self.pid, 0, @intFromPtr(&sig_info), 0);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            log.err("Unhandled error: {d}", .{e});
+            return PtraceError.Unknown;
+        },
+    }
+    return switch (sig_info.code) {
+        1, 128 => .breakpoint, // TRAP_BRKPT, SI_KERNEL
+        2 => .trace, // TRAP_TRACE
+        3 => .branch, // TRAP_BRANCH
+        4 => .hardware, // TRAP_HWBKPT
+        else => {
+            log.warn("{d}", .{sig_info.code});
+            return .unknown;
+        },
+    };
+}
 
 pub fn readRegs(pid: i64) !GpRegs {
     var native_regs: NativeRegs = undefined;
@@ -263,7 +305,6 @@ pub fn writePc(self: *const Process, pc: u64) !void {
     }
 }
 
-
 pub fn getBreakpoint(self: *const Process, addr: u64) ?Breakpoint {
     for (self.breakpoints) |breakpoint| {
         if (breakpoint.addr == addr) {
@@ -279,12 +320,12 @@ pub fn setBreakpoint(self: *const Process, addr: u64) !Breakpoint {
     try self.writeMem(addr, .{0xcc});
 }
 
-pub fn hideBreakpoint(self: *const Process, breakpoint: Breakpoint) !void {
-    const bytes: [1]u8 = .{ breakpoint.original_byte };
+pub fn hideBreakpointAndRewind(self: *const Process, breakpoint: Breakpoint) !void {
+    const bytes: [1]u8 = .{breakpoint.original_byte};
     try self.writeMem(breakpoint.addr, &bytes);
     try self.writePc(breakpoint.addr - 1);
 }
 
 pub fn resetBreakpoint(self: *const Process, breakpoint: Breakpoint) !void {
-    try self.writeMem(breakpoint.addr, .{0xcc});
+    try self.writeMem(breakpoint.addr, &.{0xcc});
 }

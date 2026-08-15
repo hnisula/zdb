@@ -31,11 +31,32 @@ pub fn traceInferior(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !
     var debug_info: DebugInfo = try .init(io, gpa, exe_path);
     defer debug_info.deinit();
 
-    const process = try Process.launch(exe_path);
-    process.cont();
+    var process = try Process.launch(exe_path);
+    try process.cont();
 
     while (true) {
         const stop_reason = try process.waitForStop();
+
+        if (stop_reason != .stopped) {
+            log.info("Process stopped (probably). Bye", .{});
+            break;
+        }
+        const addr = try process.readPc();
+
+        log.debug("Stop reason: {}", .{stop_reason});
+        const stop_signal = try process.getStopSignal();
+        log.debug("Stop signal: {}", .{stop_signal});
+        const prev_addr = addr - 1;
+        var prev_instruction: [1]u8 = undefined;
+        try process.readMem(prev_addr, &prev_instruction);
+        if (prev_instruction[0] == 0xcc) {
+            if (process.getBreakpoint(prev_addr)) |bp| {
+                try process.hideBreakpointAndRewind(bp);
+                process.bp_to_restore = bp;
+            }
+        } else {
+            // stepping? check anything?
+        }
 
         switch (stop_reason) {
             .exited, .terminated => {
@@ -45,15 +66,20 @@ pub fn traceInferior(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !
             else => {},
         }
 
-        const addr = try process.readPc();
         if (process.getBreakpoint(addr)) |bp| {
-            try process.hideBreakpoint(bp);
+            try process.hideBreakpointAndRewind(bp);
         }
         const cu = debug_info.getUnit(addr);
-        const t = try debug_info.getLine(addr);
-        _ = t;
-        log.info("STOP AT: 0x{X}", .{addr});
+        const line_info = try debug_info.getLineInfo(addr);
+        log.info("Stopped at addr: 0x{x}", .{addr});
+        if (line_info) |li| {
+            const line = try debug_info.getLine(&li);
+            log.debug("{s}:{d}:{d}", .{ li.file, li.line, li.column });
+            log.info("{s}", .{line});
+        } else {
+            log.warn("No line found", .{});
+        }
         _ = cu;
-        process.cont();
+        try process.cont();
     }
 }

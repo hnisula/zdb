@@ -9,6 +9,8 @@ const RLE = std.dwarf.RLE;
 const TAG = std.dwarf.TAG;
 const FORM = std.dwarf.FORM;
 
+const log = std.log.scoped(.dwarf_info);
+
 elf: std.debug.ElfFile,
 gpa: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
@@ -108,11 +110,11 @@ pub fn getUnits(self: *DwarfInfo, allocator: std.mem.Allocator) ![]model.Unit {
     return units;
 }
 
-pub fn getCu(self: *DwarfInfo, addr: u64) ?*const Cu {
-    for (self.cus) |cu| {
+pub fn getCu(self: *DwarfInfo, addr: u64) ?*Cu {
+    for (self.cus) |*cu| {
         for (cu.ranges) |range| {
             if (range.low <= addr and addr <= range.high) {
-                return &cu;
+                return cu;
             }
         }
     }
@@ -957,11 +959,15 @@ fn executeLineProg(header: *const LineProgHeader, cu: *const Cu, gpa: std.mem.Al
 }
 
 pub fn getLineRanges(self: *DwarfInfo, allocator: std.mem.Allocator, addr: u64) ![]model.Line {
+    const section = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_line)].?.data;
+    var cu = self.getCu(addr) orelse return error.NotFound;
+    if (cu.lines_loaded) {
+        return &.{};
+    }
+
     var arena_allocator: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
-    const section = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_line)].?.data;
-    const cu = self.getCu(addr) orelse return error.NotFound;
     var cursor: Cursor = .{ .data = section, .offset = @intCast(cu.attrs.stmt_list.?) };
 
     const header = try readLineProgHeader(arena, cu, &cursor);
@@ -989,7 +995,18 @@ pub fn getLineRanges(self: *DwarfInfo, allocator: std.mem.Allocator, addr: u64) 
             .is_stmt = line.is_stmt,
             .end_sequence = line.end_sequence,
             .prologue_end = line.prologue_end,
+            // TODO: Add optional end column based on next line info
         };
+        // log.debug("{s}:{d}:{d} ({} - {}) (addr: 0x{x}) {}", .{
+        //     line.file,
+        //     line.line,
+        //     line.column,
+        //     line.prologue_end,
+        //     line.end_sequence,
+        //     line.addr,
+        //     line.is_stmt,
+        // });
     }
+    cu.lines_loaded = true;
     return generic_lines;
 }

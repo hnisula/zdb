@@ -10,7 +10,8 @@ arena: std.heap.ArenaAllocator,
 dwarf: *DwarfInfo,
 
 units: []model.Unit,
-lines: []model.Line,
+lines: std.ArrayListUnmanaged(model.Line),
+sources: std.StringHashMapUnmanaged(model.Source),
 
 pub fn init(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !DebugInfo {
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -26,7 +27,8 @@ pub fn init(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !DebugInfo
         .arena = arena,
         .dwarf = dwarf,
         .units = units,
-        .lines = &.{},
+        .lines = .empty,
+        .sources = .empty,
     };
 }
 
@@ -46,16 +48,66 @@ pub fn getUnit(self: *DebugInfo, addr: u64) ?model.Unit {
     return null;
 }
 
-fn compareLine(addr: u64, line: model.Line) std.math.Order {
+fn compareLineAddr(addr: u64, line: model.Line) std.math.Order {
     return std.math.order(addr, line.addr);
 }
 
-pub fn getLine(self: *DebugInfo, addr: u64) !?model.Line {
-    const index = std.sort.upperBound(model.Line, self.lines, addr, compareLine);
-    if (index == self.lines.len) {
-        const line_ranges = try self.dwarf.getLineRanges(self.arena.allocator(), addr);
-        _ = line_ranges;
-        // TODO: If no lines: return error
+fn compareLineLessThan(_: void, a: model.Line, b: model.Line) bool {
+    return a.addr < b.addr;
+}
+
+pub fn getLineInfo(self: *DebugInfo, addr: u64) !?model.Line {
+    var index = std.sort.upperBound(model.Line, self.lines.items, addr, compareLineAddr);
+    if (index == self.lines.items.len) {
+        const new_lines = try self.dwarf.getLineRanges(self.arena.allocator(), addr);
+        if (new_lines.len == 0) {
+            return null;
+        }
+        try self.lines.appendSlice(self.arena.allocator(), new_lines);
+        std.sort.block(model.Line, self.lines.items, {}, compareLineLessThan);
+        index = std.sort.upperBound(model.Line, self.lines.items, addr, compareLineAddr);
     }
-    return null;
+    std.debug.assert(index > 0);
+    return if (index != self.lines.items.len) return self.lines.items[index - 1] else return null;
+}
+
+pub fn getLine(self: *DebugInfo, line: *const model.Line) ![]const u8 {
+    const a = self.arena.allocator();
+    const result = try self.sources.getOrPut(a, line.file);
+    if (!result.found_existing) {
+        result.value_ptr.*.text = try std.Io.Dir.cwd().readFileAlloc(self.io, line.file, a, .unlimited);
+    }
+    const source = result.value_ptr.*;
+    const line_offset = findLineOffset(source.text, line.line);
+    const line_start = line_offset + line.column - 1; // columns are 1-based indices so -1
+    const next_line_offset = findNextNewline(source.text, line_start);
+    return source.text[line_start..next_line_offset];
+}
+
+// Returns std.math.maxInt(64) if line was not found
+fn findLineOffset(source: []const u8, line: u64) u64 {
+    var it: u64 = 0;
+    var line_counter: u64 = 1; // lines are 1-based indices
+    while (it <= source.len) {
+        if (line_counter == line) {
+            return it;
+        }
+        if (source[it] == '\n') {
+            line_counter += 1;
+        }
+        it += 1;
+    }
+    return std.math.maxInt(u64);
+}
+
+// Returns std.math.maxInt(64) if newline was not found
+fn findNextNewline(source: []const u8, cursor: u64) u64 {
+    var it: u64 = cursor;
+    while (it < source.len) {
+        if (source[it] == '\n') {
+            return it;
+        }
+        it += 1;
+    }
+    return std.math.maxInt(u64);
 }

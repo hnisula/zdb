@@ -15,6 +15,10 @@ pub const Line = struct {
     end_sequence: bool,
 };
 
+pub const Source = struct {
+    text: []const u8,
+};
+
 pub const Unit = struct {
     offset: u64, // Some debug format internal value (e.g. byte offset in DWARF)
     name: []const u8,
