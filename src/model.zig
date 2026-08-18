@@ -5,6 +5,13 @@ pub const AddrRange = struct {
     high: u64,
 };
 
+// TODO: Move out of here?
+pub const SourceLoc = struct {
+    filepath: []const u8,
+    line: u64,
+    column: u64 = 0,
+};
+
 pub const Line = struct {
     addr: u64,
     line: u64,

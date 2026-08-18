@@ -314,7 +314,7 @@ pub fn getBreakpoint(self: *const Process, addr: u64) ?Breakpoint {
     return null;
 }
 
-pub fn setBreakpoint(self: *const Process, addr: u64) !Breakpoint {
+pub fn setBreakpointAddr(self: *const Process, addr: u64) !Breakpoint {
     var orig: [1]u8 = undefined;
     try self.readMem(addr, &orig);
     try self.writeMem(addr, .{0xcc});

@@ -56,10 +56,10 @@ fn compareLineLessThan(_: void, a: model.Line, b: model.Line) bool {
     return a.addr < b.addr;
 }
 
-pub fn getLineInfo(self: *DebugInfo, addr: u64) !?model.Line {
+pub fn lineForAddr(self: *DebugInfo, addr: u64) !?model.Line {
     var index = std.sort.upperBound(model.Line, self.lines.items, addr, compareLineAddr);
     if (index == self.lines.items.len) {
-        const new_lines = try self.dwarf.getLineRanges(self.arena.allocator(), addr);
+        const new_lines = try self.dwarf.lineRangesForAddr(self.arena.allocator(), addr);
         if (new_lines.len == 0) {
             return null;
         }
@@ -71,7 +71,25 @@ pub fn getLineInfo(self: *DebugInfo, addr: u64) !?model.Line {
     return if (index != self.lines.items.len) return self.lines.items[index - 1] else return null;
 }
 
-pub fn getLine(self: *DebugInfo, line: *const model.Line) ![]const u8 {
+pub fn addrsForLine(self: *DebugInfo, gpa: std.mem.Allocator, line: model.SourceLoc) []u64 {
+    ensureLinesLoaded();
+    // TODO: Map addr -> line instead of iterating all lines
+    var addrs: std.ArrayList(u64) = .empty;
+    for (self.lines.items) |l| {
+        if (l.file == line.filepath and l.line == line.line and l.is_stmt) {
+            addrs.append(gpa, l.addr);
+        }
+    }
+    return addrs;
+}
+
+pub fn ensureLinesLoaded(self: *DebugInfo) !void {
+    const new_lines = try self.dwarf.allNonLoadedLines();
+    try self.lines.appendSlice(self.arena.allocator(), new_lines);
+    std.sort.block(model.Line, self.lines.items, {}, compareLineLessThan);
+}
+
+pub fn lineText(self: *DebugInfo, line: *const model.Line) ![]const u8 {
     const a = self.arena.allocator();
     const result = try self.sources.getOrPut(a, line.file);
     if (!result.found_existing) {

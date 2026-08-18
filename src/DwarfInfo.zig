@@ -958,13 +958,8 @@ fn executeLineProg(header: *const LineProgHeader, cu: *const Cu, gpa: std.mem.Al
     return try arena.dupe(LineProgLine, lines.items);
 }
 
-pub fn getLineRanges(self: *DwarfInfo, allocator: std.mem.Allocator, addr: u64) ![]model.Line {
+pub fn getCuLineRanges(self: *DwarfInfo, allocator: std.mem.Allocator, cu: *Cu) ![]model.Line {
     const section = self.elf.dwarf.?.sections[@intFromEnum(SectionId.debug_line)].?.data;
-    var cu = self.getCu(addr) orelse return error.NotFound;
-    if (cu.lines_loaded) {
-        return &.{};
-    }
-
     var arena_allocator: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
@@ -1009,4 +1004,30 @@ pub fn getLineRanges(self: *DwarfInfo, allocator: std.mem.Allocator, addr: u64) 
     }
     cu.lines_loaded = true;
     return generic_lines;
+}
+
+pub fn lineRangesForAddr(self: *DwarfInfo, allocator: std.mem.Allocator, addr: u64) ![]model.Line {
+    const cu = self.getCu(addr) orelse return error.NotFound;
+    if (cu.lines_loaded) {
+        return &.{};
+    }
+
+    return try self.getCuLineRanges(allocator, cu);
+}
+
+pub fn allNonLoadedLines(self: *DwarfInfo, allocator: std.mem.Allocator) ![]model.Line {
+    var lines: std.ArrayList(model.Line) = .empty;
+    defer lines.deinit(allocator);
+
+    for (self.cus) |*cu| {
+        if (cu.lines_loaded) {
+            continue;
+        }
+        // TODO: Consider changing `getCuLineRanges()` to get a slice to append into if possible
+        const cu_lines = try self.getCuLineRanges(allocator, cu);
+        defer allocator.free(cu_lines);
+        try lines.appendSlice(allocator, cu_lines);
+    }
+
+    return lines.toOwnedSlice(allocator);
 }

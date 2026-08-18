@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
 
     // samples
     const sample1_module = b.createModule(.{
-        .root_source_file = b.path("src/dap/samples/sample1.zig"),
+        .root_source_file = b.path("src/samples/sample1.zig"),
         .target = t,
         .optimize = o,
     });

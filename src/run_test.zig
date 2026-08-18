@@ -41,6 +41,11 @@ pub fn traceInferior(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !
             log.info("Process stopped (probably). Bye", .{});
             break;
         }
+
+        // Read and process command
+        
+
+        // Keep debugging
         const addr = try process.readPc();
 
         log.debug("Stop reason: {}", .{stop_reason});
@@ -70,10 +75,10 @@ pub fn traceInferior(io: std.Io, gpa: std.mem.Allocator, exe_path: []const u8) !
             try process.hideBreakpointAndRewind(bp);
         }
         const cu = debug_info.getUnit(addr);
-        const line_info = try debug_info.getLineInfo(addr);
+        const line_info = try debug_info.lineForAddr(addr);
         log.info("Stopped at addr: 0x{x}", .{addr});
         if (line_info) |li| {
-            const line = try debug_info.getLine(&li);
+            const line = try debug_info.lineText(&li);
             log.debug("{s}:{d}:{d}", .{ li.file, li.line, li.column });
             log.info("{s}", .{line});
         } else {
